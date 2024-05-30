@@ -1,0 +1,312 @@
+---
+- name: Set up Springboot Application
+  hosts: ubuntu_server
+  become: yes
+
+  tasks:
+    - name: Add Repositroy ondrej/php to ubuntu
+      apt_repository:
+        repo: ppa:linuxuprising/java
+        state: present
+
+    - name: Update apt packages
+      apt:
+        update_cache: yes
+
+    - name: Install maven and jdk-17
+      apt:
+        name:
+          - maven
+          - openjdk-17-jdk
+          - mariadb-server
+          - nginx
+        state: present
+        update_cache: yes
+
+    - name: Create folder for staging
+      ansible.builtin.file:
+        path: /var/www/html/staging
+        state: directory
+        owner: root
+        group: root
+        mode: "0777"
+
+    - name: Clone Springboot Repositroy
+      git:
+        repo: https://github.com/Techchhiv/I4-SpringBoot.git
+        dest: /var/www/html/staging
+        clone: yes
+        update: yes 
+        force: yes
+    
+    - name: Modified the welcome page
+      ansible.builtin.replace:
+        path: /var/www/html/staging/src/main/resources/templates/welcome.html
+        regexp: "Welcome\\sto\\sMy\\sPage"
+        replace: "Welcome to Staging page"
+    
+    - name: Set up maria installation
+      become: yes
+      expect:
+        command: mysql_secure_installation
+        responses:
+          "Enter current password for root": "123"
+          "Switch to unix_socket authentication": "n"
+          "Change the root password?": "n"
+          "Remove anonymous users?": "y"
+          "Disallow root login remotely?": "n"
+          "Remove test database and access to it?": "n"
+          "Reload privilege tables now?": "y"
+
+    - name: Create database for staging
+      community.mysql.mysql_db:
+        login_user: root
+        login_password: 123
+        name: staging_db
+        state: present
+
+    - name: Change application properties
+      ansible.builtin.lineinfile:
+        create: yes
+        path: /var/www/html/staging/src/main/resources/application.properties
+        regexp: "^{{ item.key }}=.*" 
+        line: "{{item.key}}={{item.value}}"
+      loop:
+        - { key: "server.port", value: "8080"}
+        - { key: "spring.datasource.url", value: "jdbc:mysql://localhost:3306/staging_db"}
+        - { key: "spring.datasource.username", value: "root"}
+        - { key: "spring.datasource.password", value: "123"}
+
+    - name: Maven Clean packages
+      command: mvn clean install
+      args:
+        chdir: /var/www/html/staging/
+      environment:
+        COMPOSER_ALLOW_SUPERUSER: 1
+
+    - name: Run Springboot
+      shell: nohup mvn spring-boot:run > /var/log/springboot.log 2>&1 &
+      args:
+        chdir: /var/www/html/staging
+      environment:
+        COMPOSER_ALLOW_SUPERUSER: 1
+
+    - name: Create a service to run Springboot
+      ansible.builtin.file:
+        path: /etc/systemd/system/staging.service
+        state: touch
+        mode: "0777"
+  
+    - name: Write a service to run Springboot
+      blockinfile:
+        state: present
+        create: yes
+        path: /etc/systemd/system/staging.service
+        block: |
+          [Unit]
+          Description=Your Spring Boot Application
+          After=network.target
+
+          [Service]
+          User=john
+          ExecStart=/usr/bin/java -jar /var/www/html/staging/target/demo-0.0.1-SNAPSHOT.war
+          SuccessExitStatus=143
+          Restart=always
+          RestartSec=10
+          StandardOutput=syslog
+          StandardError=syslog
+          SyslogIdentifier=your-app
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Config for nginx staging
+      blockinfile:
+        create: yes
+        state: present
+        path: "/etc/nginx/sites-available/staging.conf"
+        block: |
+          server {
+              listen 80;
+              server_name i4gic2024.staging;
+
+              location / {
+                  proxy_pass http://localhost:8080;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+
+    - name: Create a symbolic link for staging
+      ansible.builtin.file:
+        src: "/etc/nginx/sites-available/staging.conf"
+        dest: "/etc/nginx/sites-enabled/staging.conf"
+        owner: root
+        group: root
+        state: link
+
+    - name: Start Springboot and restart nginx service
+      command: "{{ item }}"
+      loop:
+        - systemctl daemon-reload
+        - systemctl restart staging
+        - systemctl restart nginx
+      environment:
+        COMPOSER_ALLOW_SUPERUSER: 1
+
+    - name: Set staging success fact
+      set_fact:
+        staging_success: true
+
+    - name: Check if staging setup was successful
+      stat:
+        path: /var/www/html/staging
+      register: staging_check
+    
+    - name: Setup Production (If staging is successful)
+      when: staging_check.stat.exists
+      block:
+        - name: Create production 
+          ansible.builtin.file:
+            path: /var/www/html/production
+            state: directory
+
+        - name: Clone Repositroy into production
+          git:
+            repo: https://github.com/Techchhiv/I4-SpringBoot.git
+            dest: /var/www/html/production
+            update: yes
+            force: yes
+            clone: yes
+
+        - name: Modified the welcome page
+          ansible.builtin.replace:
+            path: /var/www/html/production/src/main/resources/templates/welcome.html
+            regexp: "Welcome\\sto\\sMy\\sPage"
+            replace: "Welcome to Production page"
+
+        
+        - name: Create database for production
+          community.mysql.mysql_db:
+            login_user: root
+            login_password: 123
+            name: prod_db
+            state: present
+
+        - name: Change application.properties to production
+          ansible.builtin.lineinfile:
+            create: yes
+            path: /var/www/html/production/src/main/resources/application.properties
+            regexp: "^{{ item.key }}=.*" 
+            line: "{{item.key}}={{item.value}}"
+          loop:
+            - { key: "server.port", value: "8081"}
+            - { key: "spring.datasource.url", value: "jdbc:mysql://localhost:3306/prod_db"}
+            - { key: "spring.datasource.username", value: "root"}
+            - { key: "spring.datasource.password", value: "123"}
+
+        - name: Maven Clean install 
+          command: mvn clean install
+          args:
+            chdir: /var/www/html/production
+          environment:
+            COMPOSER_ALLOW_SUPERUSER: 1
+        
+        - name: Run Springboot
+          shell: nohup mvn spring-boot:run > /var/log/springboot.log 2>&1 &
+          args:
+            chdir: /var/www/html/production
+          environment:
+            COMPOSER_ALLOW_SUPERUSER: 1
+        
+        - name: Create service for production
+          blockinfile:
+            create: yes
+            state: present
+            path: /etc/systemd/system/prod.service
+            block: |
+              [Unit]
+              Description=Your Spring Boot Application
+              After=network.target
+
+              [Service]
+              User=john
+              ExecStart=/usr/bin/java -jar /var/www/html/production/target/demo-0.0.1-SNAPSHOT.war
+              SuccessExitStatus=143
+              Restart=always
+              RestartSec=10
+              StandardOutput=syslog
+              StandardError=syslog
+              SyslogIdentifier=your-app
+
+              [Install]
+              WantedBy=multi-user.target
+
+        - name: Configure nginx for production
+          blockinfile:
+            create: yes
+            state: present
+            path: "/etc/nginx/sites-available/prod.conf"
+            block: |
+              server {
+                  listen 80;
+                  server_name i4gic2024.com;
+
+                  location / {
+                      proxy_pass http://localhost:8081;
+                      proxy_set_header Host $host;
+                      proxy_set_header X-Real-IP $remote_addr;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                      proxy_set_header X-Forwarded-Proto $scheme;
+                  }
+              }
+
+        - name: Create a symbolic link for production
+          ansible.builtin.file:
+            src: "/etc/nginx/sites-available/prod.conf"
+            dest: "/etc/nginx/sites-enabled/prod.conf"
+            owner: root
+            group: root
+            state: link
+
+        - name: Restart Nginx and start production service
+          command: "{{ item }}"
+          loop:
+            - systemctl daemon-reload
+            - systemctl restart prod
+            - systemctl restart nginx
+          environment:
+            COMPOSER_ALLOW_SUPERUSER: 1
+        
+        - name: Set production success fact
+          set_fact:
+            production_success: true
+  
+  post_tasks:
+    - name: Set email subject and body based on success or failure
+      set_fact:
+        subject: "Ansible Playbook Set up Springboot Project"
+        body: >
+          {% if staging_success is defined and staging_success %}
+            Staging for Springboot was successful.
+            {% if production_success is defined and production_success %}
+            Production for Springboot wass successful.
+            {% else %}
+            Production for Springboot failed.
+            {% endif %}
+          {% else %}
+            Staging for Springboot failed.
+          {% endif %}
+
+    - name: Send email
+      mail:
+        host: sandbox.smtp.mailtrap.io
+        port: 2525
+        username: fb9ec1d4e4e0cd
+        password: cd528dde3bc584
+        to: "techchivlim5@gmail.com"
+        subject: "{{ subject }}"
+        body: "{{ body }}"
+        from: "ansible@email.com"
